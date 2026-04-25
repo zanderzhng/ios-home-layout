@@ -1,0 +1,21 @@
+[project]
+name = "ios-home-screen-llm"
+version = "0.1.0"
+description = "Use an OpenAI-compatible LLM and libimobiledevice to inspect and organize iPhone/iPad Home Screen layouts."
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["ios", "iphone", "ipad", "homescreen", "libimobiledevice", "openai", "llm"]
+dependencies = [
+    "openai>=1.75.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.scripts]
+ios-layout-llm = "ios_layout_llm:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["ios_layout_llm"]

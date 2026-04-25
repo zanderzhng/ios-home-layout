@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+backups/
+layout_plan.json
+folder_plan.json
+repair_folder_plan.json
+state_after_autofill.plist
+*.bak
