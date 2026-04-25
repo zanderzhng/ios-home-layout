@@ -98,7 +98,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ios-home-screen-llm"
+name = "ios-home-layout"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

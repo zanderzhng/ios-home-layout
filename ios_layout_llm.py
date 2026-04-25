@@ -232,7 +232,7 @@ class DirectSpringBoardClient:
             err = self.imobiledevice.sbservices_client_start_service(
                 device,
                 ctypes.byref(client),
-                b"ios-layout-llm",
+                b"ios-home-layout",
             )
             check_err(err, "sbservices_client_start_service")
         except Exception:
@@ -334,7 +334,7 @@ def check_err(err: int, operation: str) -> None:
                 "\nThe device was found, but SpringBoardServices could not start. "
                 "Unlock the device, confirm it is paired/trusted, then retry."
                 "\nIf `idevice_id -n` sees the device but `idevice_id -l` does not, connect it by USB and retry with:"
-                "\n  uv run ios-layout-llm --connection usb inspect"
+                "\n  uv run ios-home-layout --connection usb inspect"
             )
         raise SystemExit(message)
 

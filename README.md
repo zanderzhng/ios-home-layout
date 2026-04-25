@@ -1,4 +1,4 @@
-# iOS Home Screen LLM
+# iOS Home Layout
 
 Use an OpenAI-compatible LLM and `libimobiledevice` to inspect, plan, and organize iPhone/iPad Home Screen layouts.
 
@@ -50,7 +50,7 @@ If the device only appears with `idevice_id -n`, SpringBoardServices may fail ov
 
 ```bash
 git clone <your-repo-url>
-cd ios-home-screen-llm
+cd ios-home-layout
 cp .env.example .env
 uv sync
 ```
@@ -68,21 +68,21 @@ If `OPENAI_BASE_URL` points at an endpoint root, the script will use `/v1` autom
 ## Inspect
 
 ```bash
-uv run ios-layout-llm --connection usb inspect
+uv run ios-home-layout --connection usb inspect
 ```
 
 Useful connection options:
 
 ```bash
-uv run ios-layout-llm --connection auto inspect
-uv run ios-layout-llm --connection usb inspect
-uv run ios-layout-llm --connection network inspect
+uv run ios-home-layout --connection auto inspect
+uv run ios-home-layout --connection usb inspect
+uv run ios-home-layout --connection network inspect
 ```
 
 For multiple connected devices:
 
 ```bash
-uv run ios-layout-llm --udid <device-udid> --connection usb inspect
+uv run ios-home-layout --udid <device-udid> --connection usb inspect
 ```
 
 ## Top-Level Rearrangement
@@ -90,20 +90,20 @@ uv run ios-layout-llm --udid <device-udid> --connection usb inspect
 Create a plan:
 
 ```bash
-uv run ios-layout-llm --connection usb plan \
+uv run ios-home-layout --connection usb plan \
   --instructions "Put daily apps in the dock and first page. Move games and rarely used apps later."
 ```
 
 Apply the saved plan:
 
 ```bash
-uv run ios-layout-llm --connection usb apply --plan layout_plan.json
+uv run ios-home-layout --connection usb apply --plan layout_plan.json
 ```
 
 One-shot plan and apply:
 
 ```bash
-uv run ios-layout-llm --connection usb rearrange \
+uv run ios-home-layout --connection usb rearrange \
   --instructions "Organize for work: communication, calendar, notes, files, and browser first."
 ```
 
@@ -114,14 +114,14 @@ uv run ios-layout-llm --connection usb rearrange \
 Dry run:
 
 ```bash
-uv run ios-layout-llm --connection usb folderize \
+uv run ios-home-layout --connection usb folderize \
   --instructions "基于现有布局，第一页文件夹和程序不动，第二页的文件夹不动，基于文件夹名称整理app放到文件夹里，没有合适文件夹的放到其他。"
 ```
 
 Apply:
 
 ```bash
-uv run ios-layout-llm --connection usb folderize \
+uv run ios-home-layout --connection usb folderize \
   --instructions "基于现有布局，第一页文件夹和程序不动，第二页的文件夹不动，基于文件夹名称整理app放到文件夹里，没有合适文件夹的放到其他。" \
   --apply
 ```
@@ -133,10 +133,10 @@ The generated folder plan is written to `folder_plan.json`, which is ignored by 
 Use this only if the direct SpringBoardServices backend does not work for your device/iOS version.
 
 ```bash
-uv run ios-layout-llm --backend backup plan \
+uv run ios-home-layout --backend backup plan \
   --instructions "Put daily apps in the dock and first page."
 
-uv run ios-layout-llm --backend backup apply \
+uv run ios-home-layout --backend backup apply \
   --plan layout_plan.json \
   --restore-device
 ```
@@ -144,7 +144,7 @@ uv run ios-layout-llm --backend backup apply \
 Backups are incremental by default in backup mode. Force a full backup only when needed:
 
 ```bash
-uv run ios-layout-llm --backend backup --full-backup inspect
+uv run ios-home-layout --backend backup --full-backup inspect
 ```
 
 ## Troubleshooting
@@ -161,7 +161,7 @@ Unlock the device and tap Trust if prompted.
 If SpringBoardServices cannot start, retry over USB:
 
 ```bash
-uv run ios-layout-llm --connection usb inspect
+uv run ios-home-layout --connection usb inspect
 ```
 
 If an OpenAI-compatible gateway returns an HTML page, make sure `OPENAI_BASE_URL` points at the API base, usually `/v1`.

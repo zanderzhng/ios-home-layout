@@ -1,5 +1,5 @@
 [project]
-name = "ios-home-screen-llm"
+name = "ios-home-layout"
 version = "0.1.0"
 description = "Use an OpenAI-compatible LLM and libimobiledevice to inspect and organize iPhone/iPad Home Screen layouts."
 readme = "README.md"
@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ios-layout-llm = "ios_layout_llm:main"
+ios-home-layout = "ios_layout_llm:main"
 
 [build-system]
 requires = ["setuptools>=69"]
