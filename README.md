@@ -25,10 +25,12 @@ SpringBoardServices does not reliably hide apps by omitting them from the icon s
 
 ## Requirements
 
-- macOS or Linux with `libimobiledevice` installed.
+- macOS with `libimobiledevice` installed.
 - A paired/trusted iPhone or iPad.
 - Python managed by `uv`.
 - An OpenAI-compatible API endpoint.
+
+This project has only been tested on macOS. Linux may work with compatible `libimobiledevice` packages, but it is not verified.
 
 On macOS with Homebrew:
 
