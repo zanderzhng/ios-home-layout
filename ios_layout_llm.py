@@ -25,7 +25,6 @@ from openai import OpenAI
 ROOT = Path(__file__).resolve().parent
 DEFAULT_BACKUP_ROOT = ROOT / "backups"
 DEFAULT_PLAN = ROOT / "layout_plan.json"
-DEFAULT_FOLDER_PLAN = ROOT / "folder_plan.json"
 
 SPRINGBOARD_LAYOUT_CANDIDATES = (
     "Library/SpringBoard/IconState.plist",
@@ -57,16 +56,10 @@ def main() -> None:
         description="Plan and apply iPhone/iPad Home Screen icon layouts using an OpenAI-compatible LLM."
     )
     parser.add_argument(
-        "--backend",
-        choices=("direct", "backup"),
-        default="direct",
-        help="Use SpringBoardServices directly, or use the slower backup/restore fallback.",
-    )
-    parser.add_argument(
         "--connection",
         choices=("auto", "usb", "network", "prefer-network"),
         default="auto",
-        help="Direct backend only: choose how libimobiledevice looks up the device.",
+        help="Choose how libimobiledevice looks up the device for direct plan/apply.",
     )
     parser.add_argument("--backup-root", type=Path, default=DEFAULT_BACKUP_ROOT)
     parser.add_argument("--udid", default=None)
@@ -75,103 +68,77 @@ def main() -> None:
     parser.add_argument(
         "--full-backup",
         action="store_true",
-        help="Backup backend only: force a full idevicebackup2 backup.",
+        help="Backup command only: force a full idevicebackup2 backup.",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    plan_parser = subparsers.add_parser("plan", help="Read the current layout and ask the LLM for a layout plan.")
+    plan_parser = subparsers.add_parser("plan", help="Read the current layout and ask the LLM for a full layout plan.")
     plan_parser.add_argument("--instructions", required=True)
     plan_parser.add_argument("--out", type=Path, default=DEFAULT_PLAN)
-    plan_parser.add_argument("--skip-backup", action="store_true", help="Backup backend only: reuse the latest local backup.")
 
-    apply_parser = subparsers.add_parser("apply", help="Apply a saved plan.")
+    apply_parser = subparsers.add_parser("apply", help="Apply a saved full layout plan to the connected device.")
     apply_parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
-    apply_parser.add_argument("--restore-device", action="store_true", help="Backup backend only: restore after editing the backup.")
+    apply_parser.add_argument("--dry-run", action="store_true", help="Validate and summarize the plan without writing to the device.")
 
-    rearrange_parser = subparsers.add_parser("rearrange", help="Plan and apply in one command.")
-    rearrange_parser.add_argument("--instructions", required=True)
-    rearrange_parser.add_argument("--out", type=Path, default=DEFAULT_PLAN)
-    rearrange_parser.add_argument(
-        "--restore-device",
-        action="store_true",
-        help="Backup backend only: restore after editing the backup.",
-    )
-    rearrange_parser.add_argument("--skip-backup", action="store_true", help="Backup backend only: reuse the latest local backup.")
+    subparsers.add_parser("backup", help="Create an idevicebackup2 backup for fallback workflows.")
 
-    inspect_parser = subparsers.add_parser("inspect", help="Print the current top-level icon layout.")
-    inspect_parser.add_argument("--skip-backup", action="store_true", help="Backup backend only: reuse the latest local backup.")
-
-    folderize_parser = subparsers.add_parser(
-        "folderize",
-        help="Move loose apps into existing page-2 folders while keeping page 1 and page-2 folder positions fixed.",
-    )
-    folderize_parser.add_argument("--instructions", required=True)
-    folderize_parser.add_argument("--out", type=Path, default=DEFAULT_FOLDER_PLAN)
-    folderize_parser.add_argument("--apply", action="store_true", help="Apply the generated folder assignment plan.")
-    folderize_parser.add_argument("--skip-backup", action="store_true", help="Backup backend only: reuse the latest local backup.")
+    apply_backup_parser = subparsers.add_parser("apply-backup", help="Apply a saved full layout plan to the latest local backup.")
+    apply_backup_parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
+    apply_backup_parser.add_argument("--restore-device", action="store_true", help="Restore the edited backup to the device.")
 
     args = parser.parse_args()
 
-    layout_file: LayoutFile | None = None
-    if args.backend == "backup":
-        if args.command in {"plan", "rearrange", "inspect"} and not args.skip_backup:
-            run_backup(args.backup_root, args.udid, full=args.full_backup)
-        backup_dir = latest_backup_dir(args.backup_root)
-        layout_file = find_layout_file(backup_dir)
-        state = read_layout_state(layout_file)
-    else:
+    if args.command == "backup":
+        run_backup(args.backup_root, args.udid, full=args.full_backup)
+        return
+
+    if args.command == "plan":
         state = DirectSpringBoardClient(args.udid, args.connection).get_icon_state()
-
-    catalog, current_layout = collect_top_level_items(state)
-    dock_size = args.dock_size or max(4, len(current_layout["dock"]))
-
-    if args.command == "inspect":
-        print_layout_summary(catalog, current_layout)
-        return
-
-    if args.command == "folderize":
-        context = collect_folderize_context(state)
-        plan = request_folder_plan(context, args.instructions)
-        validated_plan = validate_folder_plan(plan, context)
-        write_json(args.out, validated_plan)
-        print(f"Wrote validated folder plan to {args.out}")
-        print_folder_plan_summary(validated_plan, context)
-        if args.apply:
-            updated_state = build_folderized_state(state, validated_plan)
-            write_layout(args, layout_file, updated_state)
-            verify_folderized_state(state, read_current_state(args, layout_file), validated_plan)
-            print("Verified layout after apply.")
-        else:
-            print("Dry run only. Re-run with --apply to write this plan.")
-        return
-
-    if args.command in {"plan", "rearrange"}:
-        plan = request_plan(
-            catalog=catalog,
-            current_layout=current_layout,
+        context = collect_full_layout_context(state)
+        plan = request_full_layout_plan(
+            context=context,
             instructions=args.instructions,
             page_size=args.page_size,
-            dock_size=dock_size,
+            dock_size=args.dock_size or max(4, len(context["current_layout"]["dock"])),
         )
-        validated_plan = validate_plan(plan, catalog, current_layout, args.page_size, dock_size)
+        validated_plan = validate_full_layout_plan(plan, context, args.page_size, args.dock_size)
         write_json(args.out, validated_plan)
         print(f"Wrote validated plan to {args.out}")
-        print_plan_summary(validated_plan)
-
-        if args.command == "plan":
-            return
-
-        updated_state = build_state_from_plan(state, catalog, validated_plan, args.page_size, dock_size)
-        write_layout(args, layout_file, updated_state)
+        print_full_layout_plan_summary(validated_plan, context)
         return
 
     if args.command == "apply":
+        state = DirectSpringBoardClient(args.udid, args.connection).get_icon_state()
+        context = collect_full_layout_context(state)
         plan = read_json(args.plan)
-        validated_plan = validate_plan(plan, catalog, current_layout, args.page_size, dock_size)
-        updated_state = build_state_from_plan(state, catalog, validated_plan, args.page_size, dock_size)
-        write_layout(args, layout_file, updated_state)
-        print_plan_summary(validated_plan)
+        validated_plan = validate_full_layout_plan(plan, context, args.page_size, args.dock_size)
+        print_full_layout_plan_summary(validated_plan, context)
+        if args.dry_run:
+            print("Dry run only. No device changes were made.")
+            return
+        updated_state = build_full_layout_state(state, validated_plan, context)
+        DirectSpringBoardClient(args.udid, args.connection).set_icon_state(updated_state)
+        verify_full_layout_applied(validated_plan, DirectSpringBoardClient(args.udid, args.connection).get_icon_state())
+        print("Applied and verified layout on device.")
+        return
+
+    if args.command == "apply-backup":
+        backup_dir = latest_backup_dir(args.backup_root)
+        layout_file = find_layout_file(backup_dir)
+        state = read_layout_state(layout_file)
+        context = collect_full_layout_context(state)
+        plan = read_json(args.plan)
+        validated_plan = validate_full_layout_plan(plan, context, args.page_size, args.dock_size)
+        print_full_layout_plan_summary(validated_plan, context)
+        updated_state = build_full_layout_state(state, validated_plan, context)
+        apply_plan_to_backup(layout_file, updated_state)
+        print(f"Applied plan to backup file {layout_file.content_path}")
+        if args.restore_device:
+            restore_backup(args.backup_root, args.udid)
+        else:
+            print("Backup restore skipped. Re-run with --restore-device when ready.")
+        return
 
 
 class DirectSpringBoardClient:
@@ -334,7 +301,7 @@ def check_err(err: int, operation: str) -> None:
                 "\nThe device was found, but SpringBoardServices could not start. "
                 "Unlock the device, confirm it is paired/trusted, then retry."
                 "\nIf `idevice_id -n` sees the device but `idevice_id -l` does not, connect it by USB and retry with:"
-                "\n  uv run ios-home-layout --connection usb inspect"
+                "\n  uv run ios-home-layout --connection usb plan --instructions \"Read the current layout and keep it unchanged.\""
             )
         raise SystemExit(message)
 
@@ -352,28 +319,393 @@ def connection_options(connection: str) -> int:
     return usb | network
 
 
-def write_layout(args: argparse.Namespace, layout_file: LayoutFile | None, state: Any) -> None:
-    if args.backend == "direct":
-        DirectSpringBoardClient(args.udid, args.connection).set_icon_state(state)
-        print("Applied layout directly to SpringBoardServices; no backup was created.")
+def collect_full_layout_context(state: Any) -> dict[str, Any]:
+    dock_container, page_containers = split_icon_state(state)
+    existing: dict[str, IconItem] = {}
+    catalog: dict[str, IconItem] = {}
+    folder_templates: list[dict[str, Any]] = []
+
+    def icon_ref(icon: IconItem) -> dict[str, str]:
+        return {"type": "widget" if icon.kind == "custom" else "app", "item_id": icon.item_id}
+
+    def scan_folder(folder: dict[str, Any], source: str) -> list[dict[str, str]]:
+        folder_items: list[dict[str, str]] = []
+        for page in folder.get("iconLists", []):
+            for child in flatten_icon_container(page):
+                child_icon = make_icon_item(child, source, existing)
+                if child_icon.kind == "folder":
+                    continue
+                catalog[child_icon.item_id] = child_icon
+                folder_items.append(icon_ref(child_icon))
+        return folder_items
+
+    def scan_top_container(container: Any, source: str) -> list[dict[str, Any]]:
+        refs: list[dict[str, Any]] = []
+        for item in flatten_icon_container(container):
+            icon = make_icon_item(item, source, existing)
+            if icon.kind == "folder":
+                if isinstance(item, dict):
+                    folder_templates.append(item)
+                    refs.append(
+                        {
+                            "type": "folder",
+                            "folder_id": icon.item_id,
+                            "name": icon.label,
+                            "items": scan_folder(item, f"{source}/{icon.label}"),
+                        }
+                    )
+                continue
+            catalog[icon.item_id] = icon
+            refs.append(icon_ref(icon))
+        return refs
+
+    current_layout = {
+        "dock": scan_top_container(dock_container, "dock"),
+        "pages": [scan_top_container(page, f"page-{index}") for index, page in enumerate(page_containers, start=1)],
+    }
+    return {
+        "catalog": catalog,
+        "current_layout": current_layout,
+        "folder_template": copy.deepcopy(folder_templates[0]) if folder_templates else None,
+    }
+
+
+def request_full_layout_plan(
+    context: dict[str, Any],
+    instructions: str,
+    page_size: int,
+    dock_size: int,
+) -> dict[str, Any]:
+    load_dotenv(ROOT / ".env")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    api_key = os.getenv("OPENAI_API_KEY")
+    model = os.getenv("OPENAI_MODEL")
+    if not api_key or not model:
+        raise SystemExit("OPENAI_API_KEY and OPENAI_MODEL must be set in .env")
+
+    catalog: dict[str, IconItem] = context["catalog"]
+    available_items = [
+        {
+            "item_id": item_id,
+            "label": icon.label,
+            "kind": icon.kind,
+            "bundle_id": icon.bundle_id,
+            "current_location": icon.source,
+        }
+        for item_id, icon in catalog.items()
+    ]
+    payload = {
+        "instructions": instructions,
+        "constraints": {
+            "dock_max_items": dock_size,
+            "page_max_items": page_size,
+            "emit_final_desired_layout": True,
+            "use_each_item_id_at_most_once": True,
+            "include_every_item_id_somewhere": True,
+            "folders_may_be_created_removed_or_renamed": True,
+            "apps_may_move_into_or_out_of_folders": True,
+            "widgets_or_custom_items_must_remain_top_level": True,
+            "do_not_use_null_to_hide_apps": True,
+        },
+        "current_layout": context["current_layout"],
+        "available_items": available_items,
+        "required_output_schema": {
+            "dock": [
+                {"type": "app", "item_id": "exact item_id"},
+                {"type": "folder", "name": "Folder name", "items": ["exact item_id"]},
+            ],
+            "pages": [
+                [
+                    {"type": "app", "item_id": "exact item_id"},
+                    {"type": "widget", "item_id": "exact custom/widget item_id"},
+                    {"type": "folder", "name": "Folder name", "items": ["exact item_id"]},
+                ]
+            ],
+            "notes": ["optional caveats"],
+        },
+    }
+
+    client = OpenAI(api_key=api_key, base_url=normalize_openai_base_url(base_url))
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You generate complete iPhone/iPad Home Screen layouts. Return only valid JSON. "
+                "Use only exact item_id values from the prompt. Folders are described by name and item_id contents. "
+                "Do not invent app ids. Do not omit apps to hide them."
+            ),
+        },
+        {"role": "user", "content": json.dumps(payload, indent=2, ensure_ascii=False)},
+    ]
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:
+        print(f"Structured JSON request failed, retrying without response_format: {exc}", file=sys.stderr)
+        response = client.chat.completions.create(model=model, messages=messages, temperature=0.1)
+
+    content = extract_llm_content(response)
+    if not content:
+        raise SystemExit("LLM returned an empty response.")
+    return parse_json_response(content)
+
+
+def validate_full_layout_plan(
+    plan: dict[str, Any],
+    context: dict[str, Any],
+    page_size: int,
+    dock_size: int | None,
+) -> dict[str, Any]:
+    catalog: dict[str, IconItem] = context["catalog"]
+    used: set[str] = set()
+    warnings: list[str] = []
+    max_dock = dock_size or max(4, len(context["current_layout"]["dock"]))
+
+    def normalize_item_id(raw: Any, location: str, allow_widget: bool) -> str | None:
+        item_id: Any
+        if isinstance(raw, str):
+            item_id = raw
+        elif isinstance(raw, dict):
+            item_id = raw.get("item_id")
+        else:
+            warnings.append(f"Ignored invalid item at {location}: {raw!r}")
+            return None
+        if item_id not in catalog:
+            warnings.append(f"Ignored unknown item at {location}: {item_id}")
+            return None
+        icon = catalog[item_id]
+        if icon.kind == "custom" and not allow_widget:
+            warnings.append(f"Kept widget/custom item out of folder at {location}: {item_id}")
+            return None
+        if item_id in used:
+            warnings.append(f"Ignored duplicate item at {location}: {item_id}")
+            return None
+        used.add(item_id)
+        return item_id
+
+    def normalize_top_ref(raw: Any, location: str) -> dict[str, Any] | None:
+        if isinstance(raw, str):
+            item_id = normalize_item_id(raw, location, allow_widget=True)
+            if item_id is None:
+                return None
+            return item_ref_for_catalog_item(catalog[item_id])
+        if not isinstance(raw, dict):
+            warnings.append(f"Ignored invalid icon at {location}: {raw!r}")
+            return None
+        ref_type = raw.get("type", "app")
+        if ref_type == "folder":
+            name = str(raw.get("name") or raw.get("title") or raw.get("displayName") or "Folder").strip() or "Folder"
+            raw_items = raw.get("items", [])
+            if not isinstance(raw_items, list):
+                warnings.append(f"Folder items must be a list at {location}; using an empty folder.")
+                raw_items = []
+            folder_items: list[str] = []
+            for index, child in enumerate(raw_items):
+                item_id = normalize_item_id(child, f"{location}.items[{index}]", allow_widget=False)
+                if item_id is not None:
+                    folder_items.append(item_id)
+            return {"type": "folder", "name": name, "items": folder_items}
+        item_id = normalize_item_id(raw, location, allow_widget=True)
+        if item_id is None:
+            return None
+        return item_ref_for_catalog_item(catalog[item_id])
+
+    raw_dock = plan.get("dock", [])
+    if not isinstance(raw_dock, list):
+        raise SystemExit("Plan field 'dock' must be a list.")
+    dock_refs = compact_refs(normalize_top_ref(raw, f"dock[{index}]") for index, raw in enumerate(raw_dock))
+    dock = dock_refs[:max_dock]
+    release_dropped_refs(dock_refs[max_dock:], used)
+    if len(dock_refs) > max_dock:
+        warnings.append(f"Moved {len(dock_refs) - max_dock} oversized dock item(s) to fallback placement.")
+
+    raw_pages = plan.get("pages", [])
+    if not isinstance(raw_pages, list):
+        raise SystemExit("Plan field 'pages' must be a list.")
+    pages: list[list[dict[str, Any]]] = []
+    for page_index, raw_page in enumerate(raw_pages, start=1):
+        if not isinstance(raw_page, list):
+            warnings.append(f"Ignored non-list page at pages[{page_index - 1}]")
+            continue
+        page = compact_refs(normalize_top_ref(raw, f"pages[{page_index - 1}][{index}]") for index, raw in enumerate(raw_page))
+        if page:
+            pages.append(page[:page_size])
+            release_dropped_refs(page[page_size:], used)
+            if len(page) > page_size:
+                warnings.append(f"Moved {len(page) - page_size} oversized page-{page_index} item(s) to fallback placement.")
+
+    append_missing_items(dock, pages, catalog, used, warnings, page_size)
+    return {
+        "schema_version": 2,
+        "dock": dock,
+        "pages": pages,
+        "notes": require_string_list(plan.get("notes", []), "notes", allow_non_strings=True),
+        "warnings": warnings,
+    }
+
+
+def item_ref_for_catalog_item(icon: IconItem) -> dict[str, str]:
+    return {"type": "widget" if icon.kind == "custom" else "app", "item_id": icon.item_id}
+
+
+def compact_refs(refs: Any) -> list[dict[str, Any]]:
+    return [ref for ref in refs if ref is not None]
+
+
+def release_dropped_refs(refs: list[dict[str, Any]], used: set[str]) -> None:
+    for ref in refs:
+        if ref.get("type") == "folder":
+            for item_id in ref.get("items", []):
+                used.discard(item_id)
+        elif "item_id" in ref:
+            used.discard(ref["item_id"])
+
+
+def append_missing_items(
+    dock: list[dict[str, Any]],
+    pages: list[list[dict[str, Any]]],
+    catalog: dict[str, IconItem],
+    used: set[str],
+    warnings: list[str],
+    page_size: int,
+) -> None:
+    missing = [item_id for item_id in catalog if item_id not in used]
+    if not missing:
         return
+    fallback = find_fallback_folder(dock, pages)
+    for item_id in missing:
+        icon = catalog[item_id]
+        if fallback is not None and icon.kind != "custom":
+            fallback["items"].append(item_id)
+        else:
+            if not pages or len(pages[-1]) >= page_size:
+                pages.append([])
+            pages[-1].append(item_ref_for_catalog_item(icon))
+        used.add(item_id)
+    target = "fallback folder" if fallback is not None else "last page"
+    warnings.append(f"Appended {len(missing)} omitted item(s) to {target}; iOS may auto-fill omitted apps otherwise.")
 
-    if layout_file is None:
-        raise SystemExit("Backup backend selected, but no layout file was loaded.")
-    apply_plan_to_backup(layout_file, state)
-    print(f"Applied plan to backup file {layout_file.content_path}")
-    if args.restore_device:
-        restore_backup(args.backup_root, args.udid)
-    else:
-        print("Device restore skipped. Re-run with --restore-device when ready.")
+
+def find_fallback_folder(dock: list[dict[str, Any]], pages: list[list[dict[str, Any]]]) -> dict[str, Any] | None:
+    folders = [ref for ref in dock if ref.get("type") == "folder"]
+    for page in pages:
+        folders.extend(ref for ref in page if ref.get("type") == "folder")
+    for preferred in ("其他", "Other", "Unsorted"):
+        for folder in folders:
+            if folder.get("name") == preferred:
+                return folder
+    return folders[-1] if folders else None
 
 
-def read_current_state(args: argparse.Namespace, layout_file: LayoutFile | None) -> Any:
-    if args.backend == "direct":
-        return DirectSpringBoardClient(args.udid, args.connection).get_icon_state()
-    if layout_file is None:
-        raise SystemExit("Backup backend selected, but no layout file was loaded.")
-    return read_layout_state(layout_file)
+def build_full_layout_state(state: Any, plan: dict[str, Any], context: dict[str, Any]) -> Any:
+    updated = copy.deepcopy(state)
+    dock_container, page_containers = split_icon_state(updated)
+    catalog: dict[str, IconItem] = context["catalog"]
+    item_by_id = {item_id: icon.original for item_id, icon in catalog.items()}
+    folder_template = context.get("folder_template")
+
+    def build_ref(ref: dict[str, Any]) -> Any:
+        if ref["type"] == "folder":
+            folder = make_folder_item(ref["name"], folder_template)
+            folder_items = [copy.deepcopy(item_by_id[item_id]) for item_id in ref.get("items", []) if item_id in item_by_id]
+            folder["iconLists"] = chunk_items(folder_items, folder_page_capacity(folder_template))
+            return folder
+        return copy.deepcopy(item_by_id[ref["item_id"]])
+
+    new_dock = [build_ref(ref) for ref in plan["dock"]]
+    new_pages = [[build_ref(ref) for ref in page] for page in plan["pages"]]
+
+    if isinstance(updated, dict):
+        updated["buttonBar"] = adapt_container_shape(dock_container, new_dock)
+        updated["iconLists"] = adapt_pages_shape(page_containers, new_pages)
+        return updated
+    if isinstance(updated, list):
+        return [adapt_container_shape(dock_container, new_dock), *adapt_pages_shape(page_containers, new_pages)]
+    raise SystemExit(f"Unsupported icon state shape: {type(updated).__name__}")
+
+
+def make_folder_item(name: str, template: Any) -> dict[str, Any]:
+    folder = copy.deepcopy(template) if isinstance(template, dict) else {"displayName": name, "iconLists": []}
+    folder["displayName"] = name
+    for key in ("name", "title"):
+        if key in folder:
+            folder[key] = name
+    folder["iconLists"] = []
+    return folder
+
+
+def folder_page_capacity(template: Any) -> int:
+    if not isinstance(template, dict):
+        return 9
+    lengths = [len(flatten_icon_container(page)) for page in template.get("iconLists", [])]
+    return max([length for length in lengths if length > 0] + [9])
+
+
+def chunk_items(items: list[Any], capacity: int) -> list[list[Any]]:
+    capacity = max(1, capacity)
+    return [items[index : index + capacity] for index in range(0, len(items), capacity)]
+
+
+def print_full_layout_plan_summary(plan: dict[str, Any], context: dict[str, Any]) -> None:
+    catalog: dict[str, IconItem] = context["catalog"]
+    folders = 0
+    top_level = 0
+    foldered = 0
+    for ref in plan["dock"]:
+        top_level += 1
+        if ref["type"] == "folder":
+            folders += 1
+            foldered += len(ref["items"])
+    for page in plan["pages"]:
+        top_level += len(page)
+        for ref in page:
+            if ref["type"] == "folder":
+                folders += 1
+                foldered += len(ref["items"])
+    print(f"Plan: {len(plan['dock'])} dock item(s), {len(plan['pages'])} page(s), {top_level} top-level icon(s), {folders} folder(s), {foldered} foldered app(s).")
+    for index, page in enumerate(plan["pages"], start=1):
+        labels = [layout_ref_label(ref, catalog) for ref in page]
+        print(f"Page {index}: " + ", ".join(labels))
+    for warning in plan.get("warnings", []):
+        print(f"Warning: {warning}")
+    for note in plan.get("notes", []):
+        print(f"Note: {note}")
+
+
+def layout_ref_label(ref: dict[str, Any], catalog: dict[str, IconItem]) -> str:
+    if ref["type"] == "folder":
+        return f"{ref['name']}({len(ref.get('items', []))})"
+    item = catalog.get(ref["item_id"])
+    return item.label if item else ref["item_id"]
+
+
+def verify_full_layout_applied(plan: dict[str, Any], state: Any) -> None:
+    context = collect_full_layout_context(state)
+    present = set(context["catalog"])
+    expected = set(full_plan_item_ids(plan))
+    missing = expected - present
+    if missing:
+        raise SystemExit(f"Verification failed: {len(missing)} planned item(s) were not found after apply: {sorted(missing)[:10]}")
+
+
+def full_plan_item_ids(plan: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for ref in plan.get("dock", []):
+        if ref.get("type") == "folder":
+            ids.extend(ref.get("items", []))
+        elif "item_id" in ref:
+            ids.append(ref["item_id"])
+    for page in plan.get("pages", []):
+        for ref in page:
+            if ref.get("type") == "folder":
+                ids.extend(ref.get("items", []))
+            elif "item_id" in ref:
+                ids.append(ref["item_id"])
+    return ids
 
 
 def run_backup(backup_root: Path, udid: str | None, full: bool) -> None:
@@ -464,29 +796,6 @@ def read_layout_state(layout_file: LayoutFile) -> dict[str, Any]:
         keys = ", ".join(sorted(str(key) for key in state.keys()))
         raise SystemExit(f"Layout plist does not contain expected iconLists/buttonBar keys. Found: {keys}")
     return state
-
-
-def collect_top_level_items(state: Any) -> tuple[dict[str, IconItem], dict[str, list[str] | list[list[str]]]]:
-    catalog: dict[str, IconItem] = {}
-    dock: list[str] = []
-    pages: list[list[str]] = []
-
-    dock_container, page_containers = split_icon_state(state)
-
-    for item in flatten_icon_container(dock_container):
-        icon = make_icon_item(item, "dock", catalog)
-        catalog[icon.item_id] = icon
-        dock.append(icon.item_id)
-
-    for page_index, page in enumerate(page_containers, start=1):
-        page_ids: list[str] = []
-        for item in flatten_icon_container(page):
-            icon = make_icon_item(item, f"page-{page_index}", catalog)
-            catalog[icon.item_id] = icon
-            page_ids.append(icon.item_id)
-        pages.append(page_ids)
-
-    return catalog, {"dock": dock, "pages": pages}
 
 
 def split_icon_state(state: Any) -> tuple[Any, list[Any]]:
@@ -584,88 +893,6 @@ def stable_id_for_item(item: dict[str, Any], label: str) -> str:
     return f"{label.lower().replace(' ', '-')}-{digest}"
 
 
-def request_plan(
-    catalog: dict[str, IconItem],
-    current_layout: dict[str, Any],
-    instructions: str,
-    page_size: int,
-    dock_size: int,
-) -> dict[str, Any]:
-    load_dotenv(ROOT / ".env")
-    base_url = os.getenv("OPENAI_BASE_URL")
-    api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("OPENAI_MODEL")
-    if not api_key or not model:
-        raise SystemExit("OPENAI_API_KEY and OPENAI_MODEL must be set in .env")
-
-    client = OpenAI(api_key=api_key, base_url=normalize_openai_base_url(base_url))
-    prompt = build_prompt(catalog, current_layout, instructions, page_size, dock_size)
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You organize iPhone and iPad Home Screen layouts. Return only valid JSON. "
-                "Use only the exact item_id values provided. Do not invent app IDs. "
-                "Existing folders may be moved as units; do not alter folder contents."
-            ),
-        },
-        {"role": "user", "content": prompt},
-    ]
-
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
-    except Exception as exc:
-        print(f"Structured JSON request failed, retrying without response_format: {exc}", file=sys.stderr)
-        response = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
-
-    content = extract_llm_content(response)
-    if not content:
-        raise SystemExit("LLM returned an empty response.")
-    return parse_json_response(content)
-
-
-def build_prompt(
-    catalog: dict[str, IconItem],
-    current_layout: dict[str, Any],
-    instructions: str,
-    page_size: int,
-    dock_size: int,
-) -> str:
-    items = [
-        {
-            "item_id": icon.item_id,
-            "label": icon.label,
-            "kind": icon.kind,
-            "bundle_id": icon.bundle_id,
-            "current_location": icon.source,
-        }
-        for icon in catalog.values()
-    ]
-    payload = {
-        "user_instructions": instructions,
-        "constraints": {
-            "dock_max_items": dock_size,
-            "page_max_items": page_size,
-            "use_each_item_at_most_once": True,
-            "unknown_or_omitted_items_are_allowed_but_should_be_minimized": True,
-            "preserve_existing_folder_contents": True,
-        },
-        "current_layout": current_layout,
-        "available_items": items,
-        "required_output_schema": {
-            "dock": ["item_id"],
-            "pages": [["item_id"]],
-            "notes": ["short rationale or caveat"],
-        },
-    }
-    return json.dumps(payload, indent=2, ensure_ascii=False)
-
-
 def parse_json_response(content: str) -> dict[str, Any]:
     stripped = content.strip()
     if stripped.startswith("```"):
@@ -712,393 +939,6 @@ def normalize_openai_base_url(base_url: str | None) -> str | None:
     return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
 
-def validate_plan(
-    plan: dict[str, Any],
-    catalog: dict[str, IconItem],
-    current_layout: dict[str, Any],
-    page_size: int,
-    dock_size: int,
-) -> dict[str, Any]:
-    dock = require_string_list(plan.get("dock", []), "dock")[:dock_size]
-    pages_raw = plan.get("pages", [])
-    if not isinstance(pages_raw, list):
-        raise SystemExit("Plan field 'pages' must be a list of pages.")
-
-    known = set(catalog)
-    used: set[str] = set()
-    clean_dock: list[str] = []
-    clean_pages: list[list[str]] = []
-    warnings: list[str] = []
-
-    for item_id in dock:
-        if item_id not in known:
-            warnings.append(f"Ignored unknown dock item: {item_id}")
-            continue
-        if item_id in used:
-            warnings.append(f"Ignored duplicate dock item: {item_id}")
-            continue
-        used.add(item_id)
-        clean_dock.append(item_id)
-
-    for page_index, page in enumerate(pages_raw, start=1):
-        page_items = require_string_list(page, f"pages[{page_index - 1}]")
-        clean_page: list[str] = []
-        for item_id in page_items:
-            if item_id not in known:
-                warnings.append(f"Ignored unknown page item: {item_id}")
-                continue
-            if item_id in used:
-                warnings.append(f"Ignored duplicate page item: {item_id}")
-                continue
-            used.add(item_id)
-            clean_page.append(item_id)
-            if len(clean_page) >= page_size:
-                break
-        if clean_page:
-            clean_pages.append(clean_page)
-
-    original_order = list(current_layout["dock"])
-    for page in current_layout["pages"]:
-        original_order.extend(page)
-
-    leftovers = [item_id for item_id in original_order if item_id not in used]
-    if leftovers:
-        warnings.append(f"Appended {len(leftovers)} omitted item(s) in original order.")
-    for item_id in leftovers:
-        if len(clean_pages) == 0 or len(clean_pages[-1]) >= page_size:
-            clean_pages.append([])
-        clean_pages[-1].append(item_id)
-
-    return {
-        "dock": clean_dock,
-        "pages": clean_pages,
-        "notes": require_string_list(plan.get("notes", []), "notes", allow_non_strings=True),
-        "warnings": warnings,
-    }
-
-
-def collect_folderize_context(state: Any) -> dict[str, Any]:
-    _, pages = split_icon_state(state)
-    if len(pages) < 2:
-        raise SystemExit("Folderize requires at least two Home Screen pages.")
-
-    existing: dict[str, IconItem] = {}
-    page1_ids: list[str] = []
-    page2_folder_ids: list[str] = []
-    target_folders: dict[str, IconItem] = {}
-    movable_apps: dict[str, IconItem] = {}
-    preserved_after_page2: list[str] = []
-
-    for item in flatten_icon_container(pages[0]):
-        icon = make_icon_item(item, "page-1", existing)
-        existing[icon.item_id] = icon
-        page1_ids.append(icon.item_id)
-
-    for item in flatten_icon_container(pages[1]):
-        icon = make_icon_item(item, "page-2", existing)
-        existing[icon.item_id] = icon
-        if icon.kind == "folder":
-            page2_folder_ids.append(icon.item_id)
-            target_folders[icon.item_id] = icon
-        else:
-            movable_apps[icon.item_id] = icon
-
-    for page_index, page in enumerate(pages[2:], start=3):
-        for item in flatten_icon_container(page):
-            icon = make_icon_item(item, f"page-{page_index}", existing)
-            existing[icon.item_id] = icon
-            if icon.kind == "folder":
-                preserved_after_page2.append(icon.item_id)
-            else:
-                movable_apps[icon.item_id] = icon
-
-    return {
-        "page1_ids": page1_ids,
-        "page2_folder_ids": page2_folder_ids,
-        "target_folders": target_folders,
-        "movable_apps": movable_apps,
-        "preserved_after_page2": preserved_after_page2,
-    }
-
-
-def request_folder_plan(context: dict[str, Any], instructions: str) -> dict[str, Any]:
-    load_dotenv(ROOT / ".env")
-    base_url = os.getenv("OPENAI_BASE_URL")
-    api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("OPENAI_MODEL")
-    if not api_key or not model:
-        raise SystemExit("OPENAI_API_KEY and OPENAI_MODEL must be set in .env")
-
-    folders = [
-        {
-            "folder_id": folder_id,
-            "label": folder.label,
-            "existing_examples": folder_content_labels(folder.original)[:25],
-            "existing_count": len(folder_content_labels(folder.original)),
-        }
-        for folder_id, folder in context["target_folders"].items()
-    ]
-    apps = [
-        {
-            "item_id": item_id,
-            "label": app.label,
-            "bundle_id": app.bundle_id,
-            "current_location": app.source,
-        }
-        for item_id, app in context["movable_apps"].items()
-    ]
-    payload = {
-        "instructions": instructions,
-        "fixed_rules": [
-            "Do not move or change page 1.",
-            "Do not move page 2 folders; they are the only allowed destination folders.",
-            "Assign a loose app to a folder only when the folder name or existing examples are a clear match.",
-            "If no specific folder is suitable and a folder named 其他 exists, use 其他 as the fallback.",
-            "Avoid null. SpringBoardServices does not reliably hide omitted apps; omitted apps can be auto-filled back onto the Home Screen.",
-            "Do not invent folders or app ids.",
-        ],
-        "destination_folders": folders,
-        "loose_apps_to_classify": apps,
-        "required_output_schema": {
-            "assignments": [
-                {
-                    "item_id": "exact app item_id",
-                    "target_folder_id": "exact folder_id or null",
-                    "reason": "brief reason",
-                }
-            ],
-            "notes": ["optional caveats"],
-        },
-    }
-
-    client = OpenAI(api_key=api_key, base_url=normalize_openai_base_url(base_url))
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You classify iPhone Home Screen apps into existing folders. "
-                "Return only valid JSON. Use only exact ids from the prompt. "
-                "When unsure, use null."
-            ),
-        },
-        {"role": "user", "content": json.dumps(payload, indent=2, ensure_ascii=False)},
-    ]
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
-    except Exception as exc:
-        print(f"Structured JSON request failed, retrying without response_format: {exc}", file=sys.stderr)
-        response = client.chat.completions.create(model=model, messages=messages, temperature=0.1)
-
-    content = extract_llm_content(response)
-    if not content:
-        raise SystemExit("LLM returned an empty response.")
-    return parse_json_response(content)
-
-
-def validate_folder_plan(plan: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    assignments_raw = plan.get("assignments", [])
-    if not isinstance(assignments_raw, list):
-        raise SystemExit("Folder plan field 'assignments' must be a list.")
-
-    movable_ids = set(context["movable_apps"])
-    folder_ids = set(context["target_folders"])
-    fallback_folder_id = "folder:其他" if "folder:其他" in folder_ids else None
-    assignments: dict[str, str | None] = {}
-    reasons: dict[str, str] = {}
-    warnings: list[str] = []
-
-    for row in assignments_raw:
-        if not isinstance(row, dict):
-            warnings.append(f"Ignored non-object assignment: {row!r}")
-            continue
-        item_id = row.get("item_id")
-        target = row.get("target_folder_id")
-        if item_id not in movable_ids:
-            warnings.append(f"Ignored unknown or fixed item: {item_id}")
-            continue
-        if target is None and fallback_folder_id is not None:
-            target = fallback_folder_id
-            warnings.append(f"Changed null target for {item_id} to {fallback_folder_id}; direct SpringBoard writes cannot hide omitted apps.")
-        if target is not None and target not in folder_ids:
-            warnings.append(f"Changed invalid target for {item_id} to null: {target}")
-            target = fallback_folder_id
-        assignments[item_id] = target
-        reason = row.get("reason")
-        if isinstance(reason, str):
-            reasons[item_id] = reason
-
-    for item_id in movable_ids:
-        assignments.setdefault(item_id, fallback_folder_id)
-
-    return {
-        "assignments": [
-            {
-                "item_id": item_id,
-                "target_folder_id": target,
-                "reason": reasons.get(item_id, ""),
-            }
-            for item_id, target in assignments.items()
-        ],
-        "notes": require_string_list(plan.get("notes", []), "notes", allow_non_strings=True),
-        "warnings": warnings,
-    }
-
-
-def build_folderized_state(state: Any, plan: dict[str, Any]) -> Any:
-    updated = copy.deepcopy(state)
-    dock, pages = split_icon_state(updated)
-    if len(pages) < 2:
-        raise SystemExit("Folderize requires at least two Home Screen pages.")
-
-    context = collect_folderize_context(updated)
-    target_folders = context["target_folders"]
-    movable_apps = context["movable_apps"]
-    page2_folder_ids = context["page2_folder_ids"]
-
-    for row in plan["assignments"]:
-        item_id = row["item_id"]
-        target_id = row["target_folder_id"]
-        if target_id is None:
-            continue
-        append_to_folder(target_folders[target_id].original, movable_apps[item_id].original)
-
-    new_page2 = [target_folders[folder_id].original for folder_id in page2_folder_ids]
-    new_pages = [pages[0], adapt_container_shape(pages[1], new_page2)]
-
-    if isinstance(updated, dict):
-        updated["buttonBar"] = dock
-        updated["iconLists"] = new_pages
-        return updated
-    if isinstance(updated, list):
-        return [dock, *new_pages]
-    raise SystemExit(f"Unsupported icon state shape: {type(updated).__name__}")
-
-
-def append_to_folder(folder: dict[str, Any], item: Any) -> None:
-    icon_lists = folder.get("iconLists")
-    if not isinstance(icon_lists, list):
-        icon_lists = []
-
-    flat_items: list[Any] = []
-    page_lengths: list[int] = []
-    for page in icon_lists:
-        page_items = flatten_icon_container(page)
-        page_lengths.append(len(page_items))
-        flat_items.extend(page_items)
-
-    flat_items.append(item)
-    capacity = max([length for length in page_lengths if length > 0] + [9])
-    folder["iconLists"] = [flat_items[index : index + capacity] for index in range(0, len(flat_items), capacity)]
-
-
-def folder_content_labels(folder: Any) -> list[str]:
-    if not isinstance(folder, dict):
-        return []
-    labels: list[str] = []
-    for page in folder.get("iconLists", []):
-        for item in flatten_icon_container(page):
-            labels.append(label_for_item(item))
-    return labels
-
-
-def label_for_item(item: Any) -> str:
-    if isinstance(item, str):
-        return prettify_identifier(item)
-    if isinstance(item, dict):
-        return first_text(item, "displayName", "name", "title") or prettify_identifier(
-            first_text(
-                item,
-                "bundleIdentifier",
-                "displayIdentifier",
-                "applicationIdentifier",
-                "webClipIdentifier",
-                "uniqueIdentifier",
-            )
-        )
-    return "Unknown"
-
-
-def print_folder_plan_summary(plan: dict[str, Any], context: dict[str, Any]) -> None:
-    folder_labels = {folder_id: folder.label for folder_id, folder in context["target_folders"].items()}
-    app_labels = {item_id: app.label for item_id, app in context["movable_apps"].items()}
-    assigned = [row for row in plan["assignments"] if row["target_folder_id"] is not None]
-    removed = [row for row in plan["assignments"] if row["target_folder_id"] is None]
-    print(f"Assignments: {len(assigned)} app(s) into folders; {len(removed)} app(s) removed from Home Screen.")
-    for row in assigned:
-        print(f"  - {app_labels[row['item_id']]} -> {folder_labels[row['target_folder_id']]}")
-    if removed:
-        print("Removed from Home Screen:")
-        print("  " + ", ".join(app_labels[row["item_id"]] for row in removed))
-    for warning in plan.get("warnings", []):
-        print(f"Warning: {warning}")
-    for note in plan.get("notes", []):
-        print(f"Note: {note}")
-
-
-def verify_folderized_state(before: Any, after: Any, plan: dict[str, Any]) -> None:
-    before_context = collect_folderize_context(before)
-    after_context = collect_folderize_context(after)
-    _, before_pages = split_icon_state(before)
-    _, after_pages = split_icon_state(after)
-    if not before_pages or not after_pages or visible_page_signature(before_pages[0]) != visible_page_signature(after_pages[0]):
-        raise SystemExit("Verification failed: page 1 changed.")
-    before_folder_order = [context_folder_label(before_context, folder_id) for folder_id in before_context["page2_folder_ids"]]
-    after_folder_order = [context_folder_label(after_context, folder_id) for folder_id in after_context["page2_folder_ids"]]
-    if before_folder_order != after_folder_order:
-        raise SystemExit("Verification failed: page 2 folder order changed.")
-
-    folder_items_after = {
-        folder_id: set(folder_content_item_ids(folder.original))
-        for folder_id, folder in after_context["target_folders"].items()
-    }
-    all_after_home_ids = set(after_context["page1_ids"]) | set(after_context["page2_folder_ids"])
-    for folder_item_ids in folder_items_after.values():
-        all_after_home_ids.update(folder_item_ids)
-
-    for row in plan["assignments"]:
-        item_id = row["item_id"]
-        target_id = row["target_folder_id"]
-        if target_id is None:
-            if item_id in all_after_home_ids:
-                raise SystemExit(f"Verification failed: {item_id} should have been removed from Home Screen.")
-        elif item_id not in folder_items_after.get(target_id, set()):
-            raise SystemExit(f"Verification failed: {item_id} was not found in target folder {target_id}.")
-
-
-def visible_page_signature(page: Any) -> list[tuple[str, str]]:
-    signature: list[tuple[str, str]] = []
-    for item in flatten_icon_container(page):
-        if isinstance(item, dict) and "iconLists" in item:
-            kind = "custom" if item.get("iconType") == "custom" else "folder"
-        else:
-            kind = "app"
-        signature.append((kind, label_for_item(item)))
-    return signature
-
-
-def context_folder_label(context: dict[str, Any], folder_id: str) -> str:
-    folder = context["target_folders"].get(folder_id)
-    return folder.label if folder else folder_id
-
-
-def folder_content_item_ids(folder: Any) -> list[str]:
-    if not isinstance(folder, dict):
-        return []
-    existing: dict[str, IconItem] = {}
-    ids: list[str] = []
-    for page in folder.get("iconLists", []):
-        for item in flatten_icon_container(page):
-            icon = make_icon_item(item, "folder", existing)
-            existing[icon.item_id] = icon
-            ids.append(icon.item_id)
-    return ids
-
-
 def require_string_list(value: Any, field: str, allow_non_strings: bool = False) -> list[str]:
     if not isinstance(value, list):
         raise SystemExit(f"Plan field '{field}' must be a list.")
@@ -1111,31 +951,6 @@ def require_string_list(value: Any, field: str, allow_non_strings: bool = False)
         else:
             raise SystemExit(f"Plan field '{field}' must contain only strings.")
     return result
-
-
-def build_state_from_plan(
-    state: Any,
-    catalog: dict[str, IconItem],
-    plan: dict[str, Any],
-    page_size: int,
-    dock_size: int,
-) -> Any:
-    updated = copy.deepcopy(state)
-    item_by_id = {item_id: icon.original for item_id, icon in catalog.items()}
-    new_dock = [item_by_id[item_id] for item_id in plan["dock"][:dock_size]]
-    new_pages = [[item_by_id[item_id] for item_id in page[:page_size]] for page in plan["pages"]]
-
-    if isinstance(updated, dict):
-        updated["buttonBar"] = adapt_container_shape(updated.get("buttonBar", []), new_dock)
-        updated["iconLists"] = adapt_pages_shape(updated.get("iconLists", []), new_pages)
-        return updated
-
-    if isinstance(updated, list):
-        dock_container = updated[0] if updated else []
-        page_containers = updated[1:] if len(updated) > 1 else []
-        return [adapt_container_shape(dock_container, new_dock), *adapt_pages_shape(page_containers, new_pages)]
-
-    raise SystemExit(f"Unsupported icon state shape: {type(updated).__name__}")
 
 
 def apply_plan_to_backup(layout_file: LayoutFile, state: Any) -> None:
@@ -1216,34 +1031,6 @@ def update_manifest_metadata(layout_file: LayoutFile) -> None:
             con.close()
         except Exception:
             pass
-
-
-def print_layout_summary(catalog: dict[str, IconItem], current_layout: dict[str, Any]) -> None:
-    print("Dock:")
-    for item_id in current_layout["dock"]:
-        print(f"  - {describe_item(catalog[item_id])}")
-    for index, page in enumerate(current_layout["pages"], start=1):
-        print(f"Page {index}:")
-        for item_id in page:
-            print(f"  - {describe_item(catalog[item_id])}")
-
-
-def print_plan_summary(plan: dict[str, Any]) -> None:
-    print("Dock:")
-    for item_id in plan["dock"]:
-        print(f"  - {item_id}")
-    for index, page in enumerate(plan["pages"], start=1):
-        print(f"Page {index}: {len(page)} item(s)")
-        print("  " + ", ".join(page))
-    for warning in plan.get("warnings", []):
-        print(f"Warning: {warning}")
-    for note in plan.get("notes", []):
-        print(f"Note: {note}")
-
-
-def describe_item(icon: IconItem) -> str:
-    bundle = f" ({icon.bundle_id})" if icon.bundle_id and icon.bundle_id != icon.item_id else ""
-    return f"{icon.label} [{icon.kind}] id={icon.item_id}{bundle}"
 
 
 def read_json(path: Path) -> dict[str, Any]:

@@ -1,27 +1,24 @@
 # iOS Home Layout
 
-Use an OpenAI-compatible LLM and `libimobiledevice` to inspect, plan, and organize iPhone/iPad Home Screen layouts.
+Use an OpenAI-compatible LLM and `libimobiledevice` to plan and apply full iPhone/iPad Home Screen layouts.
 
-The default backend talks directly to `com.apple.springboardservices`, so normal use does not create an iOS backup. A slower `idevicebackup2` backend is kept as a fallback.
+The default path talks directly to `com.apple.springboardservices`, so normal use does not create an iOS backup. A backup/apply-backup workflow is available when you want a local `idevicebackup2` fallback.
+
+## Status
+
+This project has only been tested on macOS. Linux may work with compatible `libimobiledevice` packages, but it is not verified.
 
 ## Features
 
-- Inspect the current Home Screen layout over USB.
-- Ask an LLM to rearrange top-level icons.
-- Move loose apps into existing folders based on folder names and contents.
-- Keep sensitive configuration in `.env`.
-- Validate model output before applying it.
-- Use `uv` for repeatable Python setup.
+- Generate one full layout plan for dock, pages, folders, and folder contents.
+- Put apps on the desktop or inside folders.
+- Move apps out of folders.
+- Create, remove, and rename folders by emitting the desired final layout.
+- Validate model output before writing to the device.
+- Keep API settings in `.env`.
+- Use `uv` for Python setup.
 
-## Safety Model
-
-- `plan` is a dry run and writes a local JSON plan only.
-- `apply` writes to the connected device.
-- `folderize --apply` writes to the connected device.
-- The direct SpringBoardServices backend does not create a backup.
-- The backup backend edits a local backup copy and only restores when `--restore-device` is provided.
-
-SpringBoardServices does not reliably hide apps by omitting them from the icon state. iOS can auto-fill omitted installed apps back onto Home Screen pages. For folder organization, the tool uses a folder named `其他` as the fallback destination when present.
+SpringBoardServices does not reliably hide apps by omitting them from the icon state. iOS can auto-fill omitted installed apps back onto Home Screen pages. To avoid that, validation appends omitted apps to a fallback folder such as `其他`, `Other`, or `Unsorted` when one exists.
 
 ## Requirements
 
@@ -29,8 +26,6 @@ SpringBoardServices does not reliably hide apps by omitting them from the icon s
 - A paired/trusted iPhone or iPad.
 - Python managed by `uv`.
 - An OpenAI-compatible API endpoint.
-
-This project has only been tested on macOS. Linux may work with compatible `libimobiledevice` packages, but it is not verified.
 
 On macOS with Homebrew:
 
@@ -44,12 +39,12 @@ Confirm the device is visible over USB:
 idevice_id -l
 ```
 
-If the device only appears with `idevice_id -n`, SpringBoardServices may fail over the network path. USB is recommended.
+USB is recommended. SpringBoardServices may fail when the device is only visible with `idevice_id -n`.
 
 ## Setup
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/zanderzhng/ios-home-layout.git
 cd ios-home-layout
 cp .env.example .env
 uv sync
@@ -65,87 +60,95 @@ OPENAI_MODEL=your-model
 
 If `OPENAI_BASE_URL` points at an endpoint root, the script will use `/v1` automatically.
 
-## Inspect
+## Commands
 
-```bash
-uv run ios-home-layout --connection usb inspect
-```
+There are four main commands:
 
-Useful connection options:
+- `plan`: read the connected device and write a validated `layout_plan.json`.
+- `apply`: apply a saved plan to the connected device, with `--dry-run` available.
+- `backup`: create an `idevicebackup2` backup for fallback workflows.
+- `apply-backup`: apply a saved plan to the latest local backup, optionally restoring it.
 
-```bash
-uv run ios-home-layout --connection auto inspect
-uv run ios-home-layout --connection usb inspect
-uv run ios-home-layout --connection network inspect
-```
-
-For multiple connected devices:
-
-```bash
-uv run ios-home-layout --udid <device-udid> --connection usb inspect
-```
-
-## Top-Level Rearrangement
-
-Create a plan:
+## Plan
 
 ```bash
 uv run ios-home-layout --connection usb plan \
-  --instructions "Put daily apps in the dock and first page. Move games and rarely used apps later."
+  --instructions "Keep page 1 as-is. Reorganize the rest by creating folders for travel, tools, finance, media, games, and home apps."
 ```
 
-Apply the saved plan:
+The plan can place apps directly on pages, create folders, rename folders, remove folders, and move apps into or out of folders.
+
+The output is `layout_plan.json` by default.
+
+## Apply
+
+Dry run first:
+
+```bash
+uv run ios-home-layout --connection usb apply --plan layout_plan.json --dry-run
+```
+
+Apply to the connected device:
 
 ```bash
 uv run ios-home-layout --connection usb apply --plan layout_plan.json
 ```
 
-One-shot plan and apply:
+For multiple connected devices:
 
 ```bash
-uv run ios-home-layout --connection usb rearrange \
-  --instructions "Organize for work: communication, calendar, notes, files, and browser first."
+uv run ios-home-layout --udid <device-udid> --connection usb apply --plan layout_plan.json
 ```
 
-## Folder Organization
+## Backup
 
-`folderize` is for workflows where page 1 should stay fixed and existing page-2 folders are the destination folders.
-
-Dry run:
+Create an incremental backup:
 
 ```bash
-uv run ios-home-layout --connection usb folderize \
-  --instructions "基于现有布局，第一页文件夹和程序不动，第二页的文件夹不动，基于文件夹名称整理app放到文件夹里，没有合适文件夹的放到其他。"
+uv run ios-home-layout backup
 ```
 
-Apply:
+Force a full backup only when needed:
 
 ```bash
-uv run ios-home-layout --connection usb folderize \
-  --instructions "基于现有布局，第一页文件夹和程序不动，第二页的文件夹不动，基于文件夹名称整理app放到文件夹里，没有合适文件夹的放到其他。" \
-  --apply
+uv run ios-home-layout --full-backup backup
 ```
 
-The generated folder plan is written to `folder_plan.json`, which is ignored by Git.
+## Apply Backup
 
-## Backup Fallback
-
-Use this only if the direct SpringBoardServices backend does not work for your device/iOS version.
+Apply a saved plan to the latest local backup:
 
 ```bash
-uv run ios-home-layout --backend backup plan \
-  --instructions "Put daily apps in the dock and first page."
-
-uv run ios-home-layout --backend backup apply \
-  --plan layout_plan.json \
-  --restore-device
+uv run ios-home-layout apply-backup --plan layout_plan.json
 ```
 
-Backups are incremental by default in backup mode. Force a full backup only when needed:
+Apply and restore the edited backup to the device:
 
 ```bash
-uv run ios-home-layout --backend backup --full-backup inspect
+uv run ios-home-layout apply-backup --plan layout_plan.json --restore-device
 ```
+
+## Plan Format
+
+Plans describe the final desired layout:
+
+```json
+{
+  "schema_version": 2,
+  "dock": [
+    {"type": "app", "item_id": "com.apple.mobilesafari"}
+  ],
+  "pages": [
+    [
+      {"type": "folder", "name": "Tools", "items": ["com.example.ssh", "com.example.calc"]},
+      {"type": "app", "item_id": "com.example.mail"}
+    ]
+  ],
+  "notes": []
+}
+```
+
+Folder removal is represented by not emitting that folder in the final layout. Folder creation is represented by emitting a new folder object. Folder rename is represented by changing the folder `name`.
 
 ## Troubleshooting
 
@@ -161,7 +164,7 @@ Unlock the device and tap Trust if prompted.
 If SpringBoardServices cannot start, retry over USB:
 
 ```bash
-uv run ios-home-layout --connection usb inspect
+uv run ios-home-layout --connection usb plan --instructions "Summarize current layout without changing intent."
 ```
 
 If an OpenAI-compatible gateway returns an HTML page, make sure `OPENAI_BASE_URL` points at the API base, usually `/v1`.
