@@ -14,11 +14,12 @@ This project has only been tested on macOS. Linux may work with compatible `libi
 - Put apps on the desktop or inside folders.
 - Move apps out of folders.
 - Create, remove, and rename folders by emitting the desired final layout.
+- Preserve page 1 when the prompt asks to keep it unchanged.
 - Validate model output before writing to the device.
 - Keep API settings in `.env`.
 - Use `uv` for Python setup.
 
-SpringBoardServices does not reliably hide apps by omitting them from the icon state. iOS can auto-fill omitted installed apps back onto Home Screen pages. To avoid that, validation appends omitted apps to a fallback folder such as `其他`, `Other`, or `Unsorted` when one exists.
+SpringBoardServices does not reliably hide apps by omitting them from the icon state. iOS can auto-fill omitted installed apps back onto Home Screen pages. To avoid that, validation appends omitted apps to a fallback folder such as `其他`, `Other`, `Unsorted`, `Misc`, or `杂项`, or creates an `Other` folder when needed.
 
 ## Requirements
 
@@ -77,6 +78,13 @@ uv run ios-home-layout --connection usb plan \
 ```
 
 The plan can place apps directly on pages, create folders, rename folders, remove folders, and move apps into or out of folders.
+
+For a one-page iPad-style layout:
+
+```bash
+uv run ios-home-layout --connection usb plan \
+  --instructions "Keep first page folders and widgets as-is. Move all other apps into existing folders if they fit. If they do not fit, put them in Other. I only want one page."
+```
 
 The output is `layout_plan.json` by default.
 
@@ -149,6 +157,12 @@ Plans describe the final desired layout:
 ```
 
 Folder removal is represented by not emitting that folder in the final layout. Folder creation is represented by emitting a new folder object. Folder rename is represented by changing the folder `name`.
+
+Folder capacity can be tuned:
+
+```bash
+uv run ios-home-layout --connection usb --folder-page-size 9 --max-folder-pages 15 apply --plan layout_plan.json --dry-run
+```
 
 ## Troubleshooting
 

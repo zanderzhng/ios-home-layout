@@ -63,7 +63,9 @@ def main() -> None:
     )
     parser.add_argument("--backup-root", type=Path, default=DEFAULT_BACKUP_ROOT)
     parser.add_argument("--udid", default=None)
-    parser.add_argument("--page-size", type=int, default=24)
+    parser.add_argument("--page-size", type=int, default=None)
+    parser.add_argument("--folder-page-size", type=int, default=9)
+    parser.add_argument("--max-folder-pages", type=int, default=15)
     parser.add_argument("--dock-size", type=int, default=None)
     parser.add_argument(
         "--full-backup",
@@ -102,7 +104,16 @@ def main() -> None:
             page_size=args.page_size,
             dock_size=args.dock_size or max(4, len(context["current_layout"]["dock"])),
         )
-        validated_plan = validate_full_layout_plan(plan, context, args.page_size, args.dock_size)
+        page_size = args.page_size or infer_page_size(context)
+        validated_plan = validate_full_layout_plan(
+            plan,
+            context,
+            page_size,
+            args.folder_page_size,
+            args.max_folder_pages,
+            args.dock_size,
+            args.instructions,
+        )
         write_json(args.out, validated_plan)
         print(f"Wrote validated plan to {args.out}")
         print_full_layout_plan_summary(validated_plan, context)
@@ -112,7 +123,15 @@ def main() -> None:
         state = DirectSpringBoardClient(args.udid, args.connection).get_icon_state()
         context = collect_full_layout_context(state)
         plan = read_json(args.plan)
-        validated_plan = validate_full_layout_plan(plan, context, args.page_size, args.dock_size)
+        page_size = args.page_size or infer_page_size(context)
+        validated_plan = validate_full_layout_plan(
+            plan,
+            context,
+            page_size,
+            args.folder_page_size,
+            args.max_folder_pages,
+            args.dock_size,
+        )
         print_full_layout_plan_summary(validated_plan, context)
         if args.dry_run:
             print("Dry run only. No device changes were made.")
@@ -129,7 +148,15 @@ def main() -> None:
         state = read_layout_state(layout_file)
         context = collect_full_layout_context(state)
         plan = read_json(args.plan)
-        validated_plan = validate_full_layout_plan(plan, context, args.page_size, args.dock_size)
+        page_size = args.page_size or infer_page_size(context)
+        validated_plan = validate_full_layout_plan(
+            plan,
+            context,
+            page_size,
+            args.folder_page_size,
+            args.max_folder_pages,
+            args.dock_size,
+        )
         print_full_layout_plan_summary(validated_plan, context)
         updated_state = build_full_layout_state(state, validated_plan, context)
         apply_plan_to_backup(layout_file, updated_state)
@@ -370,6 +397,11 @@ def collect_full_layout_context(state: Any) -> dict[str, Any]:
     }
 
 
+def infer_page_size(context: dict[str, Any]) -> int:
+    lengths = [len(page) for page in context["current_layout"].get("pages", []) if page]
+    return max(lengths + [24])
+
+
 def request_full_layout_plan(
     context: dict[str, Any],
     instructions: str,
@@ -394,11 +426,13 @@ def request_full_layout_plan(
         }
         for item_id, icon in catalog.items()
     ]
+    effective_instructions = normalize_user_instructions(instructions)
     payload = {
-        "instructions": instructions,
+        "instructions": effective_instructions,
         "constraints": {
             "dock_max_items": dock_size,
             "page_max_items": page_size,
+            "folder_page_size": 9,
             "emit_final_desired_layout": True,
             "use_each_item_id_at_most_once": True,
             "include_every_item_id_somewhere": True,
@@ -406,6 +440,10 @@ def request_full_layout_plan(
             "apps_may_move_into_or_out_of_folders": True,
             "widgets_or_custom_items_must_remain_top_level": True,
             "do_not_use_null_to_hide_apps": True,
+            "do_not_put_unrelated_apps_in_wallet_or_finance_folders_unless_they_are_payment_banking_finance_apps": True,
+            "do_not_dump_unrelated_apps_into_one_folder": True,
+            "when_user_asks_to_keep_first_page_preserve_it_exactly": True,
+            "if_existing_folders_do_not_fit_apps_create_a_sensible_misc_folder_or_leave_overflow_on_later_pages": True,
         },
         "current_layout": context["current_layout"],
         "available_items": available_items,
@@ -454,11 +492,32 @@ def request_full_layout_plan(
     return parse_json_response(content)
 
 
+def normalize_user_instructions(instructions: str) -> str:
+    lowered = instructions.lower()
+    extra: list[str] = []
+    if "remove" in lowered and ("desktop" in lowered or "home screen" in lowered):
+        extra.append(
+            "Important implementation note: SpringBoardServices cannot reliably hide installed apps by omitting them. "
+            "For any app the user says to remove from the desktop/Home Screen, put it into a catch-all folder named Other or Unsorted instead."
+        )
+    if "one page" in lowered or "only one page" in lowered or "只要一页" in instructions:
+        extra.append(
+            "Keep the result to one Home Screen page when possible by putting apps into folders. "
+            "If folder capacity is exceeded, create an Other/Unsorted folder before spilling to another page."
+        )
+    if not extra:
+        return instructions
+    return instructions + "\n\n" + "\n".join(extra)
+
+
 def validate_full_layout_plan(
     plan: dict[str, Any],
     context: dict[str, Any],
     page_size: int,
+    folder_page_size: int,
+    max_folder_pages: int,
     dock_size: int | None,
+    instructions: str = "",
 ) -> dict[str, Any]:
     catalog: dict[str, IconItem] = context["catalog"]
     used: set[str] = set()
@@ -508,7 +567,15 @@ def validate_full_layout_plan(
                 item_id = normalize_item_id(child, f"{location}.items[{index}]", allow_widget=False)
                 if item_id is not None:
                     folder_items.append(item_id)
-            return {"type": "folder", "name": name, "items": folder_items}
+            kept_items, overflow_items = split_folder_items(folder_items, folder_page_size, max_folder_pages)
+            for overflow_item in overflow_items:
+                used.discard(overflow_item)
+            if overflow_items:
+                warnings.append(
+                    f"Moved {len(overflow_items)} overflow item(s) out of folder '{name}' at {location}; "
+                    f"limit is {folder_page_size * max_folder_pages} apps."
+                )
+            return {"type": "folder", "name": name, "items": kept_items}
         item_id = normalize_item_id(raw, location, allow_widget=True)
         if item_id is None:
             return None
@@ -538,6 +605,7 @@ def validate_full_layout_plan(
             if len(page) > page_size:
                 warnings.append(f"Moved {len(page) - page_size} oversized page-{page_index} item(s) to fallback placement.")
 
+    enforce_fixed_first_page(dock, pages, catalog, used, context, instructions, warnings, page_size)
     append_missing_items(dock, pages, catalog, used, warnings, page_size)
     return {
         "schema_version": 2,
@@ -546,6 +614,11 @@ def validate_full_layout_plan(
         "notes": require_string_list(plan.get("notes", []), "notes", allow_non_strings=True),
         "warnings": warnings,
     }
+
+
+def split_folder_items(item_ids: list[str], folder_page_size: int, max_folder_pages: int) -> tuple[list[str], list[str]]:
+    capacity = max(1, folder_page_size) * max(1, max_folder_pages)
+    return item_ids[:capacity], item_ids[capacity:]
 
 
 def item_ref_for_catalog_item(icon: IconItem) -> dict[str, str]:
@@ -565,6 +638,80 @@ def release_dropped_refs(refs: list[dict[str, Any]], used: set[str]) -> None:
             used.discard(ref["item_id"])
 
 
+def enforce_fixed_first_page(
+    dock: list[dict[str, Any]],
+    pages: list[list[dict[str, Any]]],
+    catalog: dict[str, IconItem],
+    used: set[str],
+    context: dict[str, Any],
+    instructions: str,
+    warnings: list[str],
+    page_size: int,
+) -> None:
+    lowered = instructions.lower()
+    if not any(phrase in lowered for phrase in ("keep first page", "keep page 1", "first page as is", "第一页")):
+        return
+    current_pages = context["current_layout"].get("pages", [])
+    if not current_pages:
+        return
+
+    first_page = copy.deepcopy(current_pages[0])
+    fixed_ids = set(layout_ref_item_ids(first_page))
+    release_refs_by_item_ids(dock, fixed_ids, used)
+    for page in pages:
+        release_refs_by_item_ids(page, fixed_ids, used)
+    for item_id in fixed_ids:
+        if item_id in catalog:
+            used.add(item_id)
+
+    if pages:
+        pages[0] = first_page[:page_size]
+    else:
+        pages.append(first_page[:page_size])
+    warnings.append("Preserved first page from the current device layout because the instructions requested it.")
+
+
+def release_refs_by_item_ids(refs: list[dict[str, Any]], item_ids: set[str], used: set[str]) -> None:
+    kept: list[dict[str, Any]] = []
+    for ref in refs:
+        if ref.get("type") == "folder":
+            original_items = list(ref.get("items", []))
+            ref["items"] = [item_id for item_id in original_items if item_id not in item_ids]
+            for item_id in original_items:
+                if item_id in item_ids:
+                    used.discard(item_id)
+            kept.append(ref)
+        elif ref.get("item_id") in item_ids:
+            used.discard(ref["item_id"])
+        else:
+            kept.append(ref)
+    refs[:] = kept
+
+
+def layout_ref_item_ids(refs: list[dict[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    for ref in refs:
+        if ref.get("type") == "folder":
+            for item in ref.get("items", []):
+                if isinstance(item, str):
+                    ids.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("item_id"), str):
+                    ids.append(item["item_id"])
+        elif "item_id" in ref:
+            ids.append(ref["item_id"])
+    return ids
+
+
+def normalize_ref_item_ids(items: list[Any]) -> list[str]:
+    ids: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            ids.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("item_id"), str):
+            ids.append(item["item_id"])
+    return ids
+
+
 def append_missing_items(
     dock: list[dict[str, Any]],
     pages: list[list[dict[str, Any]]],
@@ -577,6 +724,9 @@ def append_missing_items(
     if not missing:
         return
     fallback = find_fallback_folder(dock, pages)
+    if fallback is None and any(catalog[item_id].kind != "custom" for item_id in missing):
+        fallback = ensure_fallback_folder(dock, pages, page_size)
+        warnings.append("Created fallback folder 'Other' for omitted apps; iOS may auto-fill omitted apps otherwise.")
     for item_id in missing:
         icon = catalog[item_id]
         if fallback is not None and icon.kind != "custom":
@@ -586,7 +736,7 @@ def append_missing_items(
                 pages.append([])
             pages[-1].append(item_ref_for_catalog_item(icon))
         used.add(item_id)
-    target = "fallback folder" if fallback is not None else "last page"
+    target = f"fallback folder '{fallback['name']}'" if fallback is not None else "last page"
     warnings.append(f"Appended {len(missing)} omitted item(s) to {target}; iOS may auto-fill omitted apps otherwise.")
 
 
@@ -594,11 +744,23 @@ def find_fallback_folder(dock: list[dict[str, Any]], pages: list[list[dict[str, 
     folders = [ref for ref in dock if ref.get("type") == "folder"]
     for page in pages:
         folders.extend(ref for ref in page if ref.get("type") == "folder")
-    for preferred in ("其他", "Other", "Unsorted"):
+    for preferred in ("其他", "Other", "Unsorted", "Misc", "杂项"):
         for folder in folders:
             if folder.get("name") == preferred:
                 return folder
-    return folders[-1] if folders else None
+    return None
+
+
+def ensure_fallback_folder(dock: list[dict[str, Any]], pages: list[list[dict[str, Any]]], page_size: int) -> dict[str, Any]:
+    folder = {"type": "folder", "name": "Other", "items": []}
+    if not pages:
+        pages.append([])
+    target_page = pages[0]
+    if len(target_page) >= page_size:
+        pages.append([])
+        target_page = pages[-1]
+    target_page.append(folder)
+    return folder
 
 
 def build_full_layout_state(state: Any, plan: dict[str, Any], context: dict[str, Any]) -> Any:
@@ -611,7 +773,8 @@ def build_full_layout_state(state: Any, plan: dict[str, Any], context: dict[str,
     def build_ref(ref: dict[str, Any]) -> Any:
         if ref["type"] == "folder":
             folder = make_folder_item(ref["name"], folder_template)
-            folder_items = [copy.deepcopy(item_by_id[item_id]) for item_id in ref.get("items", []) if item_id in item_by_id]
+            folder_item_ids = normalize_ref_item_ids(ref.get("items", []))
+            folder_items = [copy.deepcopy(item_by_id[item_id]) for item_id in folder_item_ids if item_id in item_by_id]
             folder["iconLists"] = chunk_items(folder_items, folder_page_capacity(folder_template))
             return folder
         return copy.deepcopy(item_by_id[ref["item_id"]])
