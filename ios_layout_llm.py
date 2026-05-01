@@ -606,7 +606,7 @@ def validate_full_layout_plan(
                 warnings.append(f"Moved {len(page) - page_size} oversized page-{page_index} item(s) to fallback placement.")
 
     enforce_fixed_first_page(dock, pages, catalog, used, context, instructions, warnings, page_size)
-    append_missing_items(dock, pages, catalog, used, warnings, page_size)
+    append_missing_items(dock, pages, catalog, used, warnings, page_size, folder_page_size, max_folder_pages)
     return {
         "schema_version": 2,
         "dock": dock,
@@ -656,6 +656,12 @@ def enforce_fixed_first_page(
         return
 
     first_page = copy.deepcopy(current_pages[0])
+    if asks_to_keep_first_page_folders_and_widgets_only(instructions):
+        first_page = [
+            ref
+            for ref in first_page
+            if ref.get("type") in {"folder", "widget"}
+        ]
     fixed_ids = set(layout_ref_item_ids(first_page))
     release_refs_by_item_ids(dock, fixed_ids, used)
     for page in pages:
@@ -668,7 +674,18 @@ def enforce_fixed_first_page(
         pages[0] = first_page[:page_size]
     else:
         pages.append(first_page[:page_size])
-    warnings.append("Preserved first page from the current device layout because the instructions requested it.")
+    if asks_to_keep_first_page_folders_and_widgets_only(instructions):
+        warnings.append("Preserved first-page folders/widgets from the current device layout because the instructions requested it.")
+    else:
+        warnings.append("Preserved first page from the current device layout because the instructions requested it.")
+
+
+def asks_to_keep_first_page_folders_and_widgets_only(instructions: str) -> bool:
+    lowered = instructions.lower()
+    return (
+        ("first page folders" in lowered and ("widget" in lowered or "widgets" in lowered))
+        or ("第一页" in instructions and "文件夹" in instructions and ("widget" in lowered or "小组件" in instructions))
+    )
 
 
 def release_refs_by_item_ids(refs: list[dict[str, Any]], item_ids: set[str], used: set[str]) -> None:
@@ -719,6 +736,8 @@ def append_missing_items(
     used: set[str],
     warnings: list[str],
     page_size: int,
+    folder_page_size: int,
+    max_folder_pages: int,
 ) -> None:
     missing = [item_id for item_id in catalog if item_id not in used]
     if not missing:
@@ -730,7 +749,12 @@ def append_missing_items(
     for item_id in missing:
         icon = catalog[item_id]
         if fallback is not None and icon.kind != "custom":
-            fallback["items"].append(item_id)
+            if folder_has_capacity(fallback, folder_page_size, max_folder_pages):
+                fallback["items"].append(item_id)
+            else:
+                if not pages or len(pages[-1]) >= page_size:
+                    pages.append([])
+                pages[-1].append(item_ref_for_catalog_item(icon))
         else:
             if not pages or len(pages[-1]) >= page_size:
                 pages.append([])
@@ -749,6 +773,10 @@ def find_fallback_folder(dock: list[dict[str, Any]], pages: list[list[dict[str, 
             if folder.get("name") == preferred:
                 return folder
     return None
+
+
+def folder_has_capacity(folder: dict[str, Any], folder_page_size: int, max_folder_pages: int) -> bool:
+    return len(folder.get("items", [])) < max(1, folder_page_size) * max(1, max_folder_pages)
 
 
 def ensure_fallback_folder(dock: list[dict[str, Any]], pages: list[list[dict[str, Any]]], page_size: int) -> dict[str, Any]:
