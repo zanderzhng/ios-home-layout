@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 backups/
+backup.json
 layout_plan.json
 folder_plan.json
 repair_folder_plan.json

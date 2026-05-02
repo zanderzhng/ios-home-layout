@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import ctypes
 import ctypes.util
@@ -8,12 +9,9 @@ import hashlib
 import json
 import os
 import plistlib
-import shutil
-import sqlite3
-import subprocess
 import sys
-import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -23,23 +21,10 @@ from openai import OpenAI
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_BACKUP_ROOT = ROOT / "backups"
 DEFAULT_PLAN = ROOT / "layout_plan.json"
-
-SPRINGBOARD_LAYOUT_CANDIDATES = (
-    "Library/SpringBoard/IconState.plist",
-    "Library/SpringBoard/DesiredIconState.plist",
-)
-
-
-@dataclass(frozen=True)
-class LayoutFile:
-    backup_dir: Path
-    file_id: str
-    domain: str
-    relative_path: str
-    content_path: Path
-
+DEFAULT_BACKUP = ROOT / "backup.json"
+DEFAULT_INSTRUCTIONS = "Organize the Home Screen into a simple, tidy layout. Keep the dock useful."
+IDEVICE_LOOKUP_USBMUX = 1 << 1
 
 @dataclass
 class IconItem:
@@ -55,48 +40,33 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Plan and apply iPhone/iPad Home Screen icon layouts using an OpenAI-compatible LLM."
     )
-    parser.add_argument(
-        "--connection",
-        choices=("auto", "usb", "network", "prefer-network"),
-        default="auto",
-        help="Choose how libimobiledevice looks up the device for direct plan/apply.",
-    )
-    parser.add_argument("--backup-root", type=Path, default=DEFAULT_BACKUP_ROOT)
     parser.add_argument("--udid", default=None)
     parser.add_argument("--page-size", type=int, default=None)
     parser.add_argument("--folder-page-size", type=int, default=9)
     parser.add_argument("--max-folder-pages", type=int, default=15)
     parser.add_argument("--dock-size", type=int, default=None)
-    parser.add_argument(
-        "--full-backup",
-        action="store_true",
-        help="Backup command only: force a full idevicebackup2 backup.",
-    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    plan_parser = subparsers.add_parser("plan", help="Read the current layout and ask the LLM for a full layout plan.")
-    plan_parser.add_argument("--instructions", required=True)
-    plan_parser.add_argument("--out", type=Path, default=DEFAULT_PLAN)
+    plan_parser = subparsers.add_parser("plan", help="Read the device and write layout_plan.json.")
+    plan_parser.add_argument("instructions", nargs="?", default=DEFAULT_INSTRUCTIONS)
 
-    apply_parser = subparsers.add_parser("apply", help="Apply a saved full layout plan to the connected device.")
-    apply_parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
-    apply_parser.add_argument("--dry-run", action="store_true", help="Validate and summarize the plan without writing to the device.")
+    apply_parser = subparsers.add_parser("apply", help="Apply layout_plan.json or backup.json to the device.")
+    apply_parser.add_argument("file", nargs="?", type=Path, default=DEFAULT_PLAN)
+    apply_parser.add_argument("--dry-run", action="store_true", help="Validate and summarize without writing to the device.")
 
-    subparsers.add_parser("backup", help="Create an idevicebackup2 backup for fallback workflows.")
-
-    apply_backup_parser = subparsers.add_parser("apply-backup", help="Apply a saved full layout plan to the latest local backup.")
-    apply_backup_parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
-    apply_backup_parser.add_argument("--restore-device", action="store_true", help="Restore the edited backup to the device.")
+    subparsers.add_parser("backup", help="Save the current device layout to backup.json.")
 
     args = parser.parse_args()
 
     if args.command == "backup":
-        run_backup(args.backup_root, args.udid, full=args.full_backup)
+        state = DirectSpringBoardClient(args.udid).get_icon_state()
+        write_backup_json(DEFAULT_BACKUP, state)
+        print(f"Wrote backup to {DEFAULT_BACKUP}")
         return
 
     if args.command == "plan":
-        state = DirectSpringBoardClient(args.udid, args.connection).get_icon_state()
+        state = DirectSpringBoardClient(args.udid).get_icon_state()
         context = collect_full_layout_context(state)
         plan = request_full_layout_plan(
             context=context,
@@ -114,18 +84,29 @@ def main() -> None:
             args.dock_size,
             args.instructions,
         )
-        write_json(args.out, validated_plan)
-        print(f"Wrote validated plan to {args.out}")
+        write_json(DEFAULT_PLAN, validated_plan)
+        print(f"Wrote validated plan to {DEFAULT_PLAN}")
         print_full_layout_plan_summary(validated_plan, context)
         return
 
     if args.command == "apply":
-        state = DirectSpringBoardClient(args.udid, args.connection).get_icon_state()
+        saved = read_json(args.file)
+        if is_backup_json(saved):
+            state = decode_backup_json(saved)
+            context = collect_full_layout_context(state)
+            print(f"Backup: {len(context['current_layout']['dock'])} dock item(s), {len(context['current_layout']['pages'])} page(s).")
+            if args.dry_run:
+                print("Dry run only. No device changes were made.")
+                return
+            DirectSpringBoardClient(args.udid).set_icon_state(state)
+            print("Applied backup to device.")
+            return
+
+        state = DirectSpringBoardClient(args.udid).get_icon_state()
         context = collect_full_layout_context(state)
-        plan = read_json(args.plan)
         page_size = args.page_size or infer_page_size(context)
         validated_plan = validate_full_layout_plan(
-            plan,
+            saved,
             context,
             page_size,
             args.folder_page_size,
@@ -137,41 +118,15 @@ def main() -> None:
             print("Dry run only. No device changes were made.")
             return
         updated_state = build_full_layout_state(state, validated_plan, context)
-        DirectSpringBoardClient(args.udid, args.connection).set_icon_state(updated_state)
-        verify_full_layout_applied(validated_plan, DirectSpringBoardClient(args.udid, args.connection).get_icon_state())
+        DirectSpringBoardClient(args.udid).set_icon_state(updated_state)
+        verify_full_layout_applied(validated_plan, DirectSpringBoardClient(args.udid).get_icon_state())
         print("Applied and verified layout on device.")
-        return
-
-    if args.command == "apply-backup":
-        backup_dir = latest_backup_dir(args.backup_root)
-        layout_file = find_layout_file(backup_dir)
-        state = read_layout_state(layout_file)
-        context = collect_full_layout_context(state)
-        plan = read_json(args.plan)
-        page_size = args.page_size or infer_page_size(context)
-        validated_plan = validate_full_layout_plan(
-            plan,
-            context,
-            page_size,
-            args.folder_page_size,
-            args.max_folder_pages,
-            args.dock_size,
-        )
-        print_full_layout_plan_summary(validated_plan, context)
-        updated_state = build_full_layout_state(state, validated_plan, context)
-        apply_plan_to_backup(layout_file, updated_state)
-        print(f"Applied plan to backup file {layout_file.content_path}")
-        if args.restore_device:
-            restore_backup(args.backup_root, args.udid)
-        else:
-            print("Backup restore skipped. Re-run with --restore-device when ready.")
         return
 
 
 class DirectSpringBoardClient:
-    def __init__(self, udid: str | None, connection: str = "auto") -> None:
+    def __init__(self, udid: str | None) -> None:
         self.udid = udid.encode() if udid else None
-        self.connection = connection
         self.imobiledevice = load_library("imobiledevice-1.0", "libimobiledevice-1.0.dylib")
         self.plist = load_library("plist-2.0", "libplist-2.0.dylib")
         self._configure_signatures()
@@ -214,11 +169,9 @@ class DirectSpringBoardClient:
             err = self.imobiledevice.idevice_new_with_options(
                 ctypes.byref(device),
                 self.udid,
-                connection_options(self.connection),
+                IDEVICE_LOOKUP_USBMUX,
             )
             check_err(err, "idevice_new_with_options")
-        elif self.connection not in {"auto", "usb"}:
-            raise SystemExit("This libimobiledevice build does not expose idevice_new_with_options; only USB lookup is available.")
         else:
             err = self.imobiledevice.idevice_new(ctypes.byref(device), self.udid)
             check_err(err, "idevice_new")
@@ -319,7 +272,6 @@ def check_err(err: int, operation: str) -> None:
             message += (
                 "\nNo device was found by libimobiledevice. Check:"
                 "\n  - USB: idevice_id -l"
-                "\n  - Wi-Fi/network: idevice_id -n"
                 "\n  - Pair/trust state: idevicepair validate"
                 "\nUnlock the device and tap Trust if prompted. If multiple devices show up, pass --udid <udid>."
             )
@@ -327,23 +279,10 @@ def check_err(err: int, operation: str) -> None:
             message += (
                 "\nThe device was found, but SpringBoardServices could not start. "
                 "Unlock the device, confirm it is paired/trusted, then retry."
-                "\nIf `idevice_id -n` sees the device but `idevice_id -l` does not, connect it by USB and retry with:"
-                "\n  uv run ios-home-layout --connection usb plan --instructions \"Read the current layout and keep it unchanged.\""
+                "\nConnect by USB and retry with:"
+                "\n  uv run ios-home-layout plan \"Read the current layout and keep it unchanged.\""
             )
         raise SystemExit(message)
-
-
-def connection_options(connection: str) -> int:
-    usb = 1 << 1
-    network = 1 << 2
-    prefer_network = 1 << 3
-    if connection == "usb":
-        return usb
-    if connection == "network":
-        return network
-    if connection == "prefer-network":
-        return usb | network | prefer_network
-    return usb | network
 
 
 def collect_full_layout_context(state: Any) -> dict[str, Any]:
@@ -899,96 +838,6 @@ def full_plan_item_ids(plan: dict[str, Any]) -> list[str]:
     return ids
 
 
-def run_backup(backup_root: Path, udid: str | None, full: bool) -> None:
-    backup_root.mkdir(parents=True, exist_ok=True)
-    cmd = ["idevicebackup2"]
-    if udid:
-        cmd += ["--udid", udid]
-    cmd += ["backup"]
-    if full:
-        cmd += ["--full"]
-    cmd.append(str(backup_root))
-    run(cmd)
-
-
-def restore_backup(backup_root: Path, udid: str | None) -> None:
-    cmd = ["idevicebackup2"]
-    if udid:
-        cmd += ["--udid", udid]
-    cmd += ["restore", "--system", "--settings", "--skip-apps", str(backup_root)]
-    run(cmd)
-
-
-def run(cmd: list[str]) -> None:
-    print("+ " + " ".join(cmd))
-    subprocess.run(cmd, check=True)
-
-
-def latest_backup_dir(backup_root: Path) -> Path:
-    if (backup_root / "Manifest.db").exists():
-        return backup_root
-
-    candidates = [path for path in backup_root.iterdir() if (path / "Manifest.db").exists()]
-    if not candidates:
-        raise SystemExit(f"No iOS backup with Manifest.db found under {backup_root}")
-    return max(candidates, key=lambda path: (path / "Manifest.db").stat().st_mtime)
-
-
-def find_layout_file(backup_dir: Path) -> LayoutFile:
-    manifest = backup_dir / "Manifest.db"
-    con = sqlite3.connect(manifest)
-    try:
-        rows = con.execute(
-            """
-            SELECT fileID, domain, relativePath
-            FROM Files
-            WHERE domain = 'HomeDomain'
-              AND (
-                relativePath IN (?, ?)
-                OR relativePath LIKE 'Library/SpringBoard/%IconState%.plist'
-              )
-            ORDER BY
-              CASE relativePath
-                WHEN ? THEN 0
-                WHEN ? THEN 1
-                ELSE 2
-              END
-            """,
-            (
-                SPRINGBOARD_LAYOUT_CANDIDATES[0],
-                SPRINGBOARD_LAYOUT_CANDIDATES[1],
-                SPRINGBOARD_LAYOUT_CANDIDATES[0],
-                SPRINGBOARD_LAYOUT_CANDIDATES[1],
-            ),
-        ).fetchall()
-    finally:
-        con.close()
-
-    for file_id, domain, relative_path in rows:
-        content_path = backup_dir / file_id[:2] / file_id
-        if content_path.exists():
-            return LayoutFile(
-                backup_dir=backup_dir,
-                file_id=file_id,
-                domain=domain,
-                relative_path=relative_path,
-                content_path=content_path,
-            )
-
-    raise SystemExit("Could not find a SpringBoard IconState plist in the backup.")
-
-
-def read_layout_state(layout_file: LayoutFile) -> dict[str, Any]:
-    with layout_file.content_path.open("rb") as fh:
-        state = plistlib.load(fh)
-    if not isinstance(state, dict):
-        raise SystemExit(f"Unsupported layout plist shape in {layout_file.content_path}")
-    if "iconLists" not in state or "buttonBar" not in state:
-        keys = ", ".join(sorted(str(key) for key in state.keys()))
-        raise SystemExit(f"Layout plist does not contain expected iconLists/buttonBar keys. Found: {keys}")
-    return state
-
-
 def split_icon_state(state: Any) -> tuple[Any, list[Any]]:
     if isinstance(state, dict):
         return state.get("buttonBar", []), state.get("iconLists", [])
@@ -1144,14 +993,31 @@ def require_string_list(value: Any, field: str, allow_non_strings: bool = False)
     return result
 
 
-def apply_plan_to_backup(layout_file: LayoutFile, state: Any) -> None:
-    backup_path = layout_file.content_path.with_suffix(layout_file.content_path.suffix + f".{int(time.time())}.bak")
-    shutil.copy2(layout_file.content_path, backup_path)
-    with layout_file.content_path.open("wb") as fh:
-        plistlib.dump(state, fh, fmt=plistlib.FMT_BINARY, sort_keys=False)
+def write_backup_json(path: Path, state: Any) -> None:
+    payload = {
+        "schema_version": 1,
+        "kind": "ios_home_layout_backup",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "plist_base64": base64.b64encode(plistlib.dumps(state, fmt=plistlib.FMT_BINARY, sort_keys=False)).decode("ascii"),
+    }
+    write_json(path, payload)
 
-    update_manifest_metadata(layout_file)
-    print(f"Created backup of original layout file at {backup_path}")
+
+def is_backup_json(value: dict[str, Any]) -> bool:
+    return value.get("kind") == "ios_home_layout_backup" or "plist_base64" in value
+
+
+def decode_backup_json(value: dict[str, Any]) -> Any:
+    encoded = value.get("plist_base64")
+    if not isinstance(encoded, str):
+        raise SystemExit("backup.json must contain a plist_base64 string.")
+    try:
+        state = plistlib.loads(base64.b64decode(encoded))
+    except Exception as exc:
+        raise SystemExit(f"Could not read backup.json: {exc}") from exc
+    if not isinstance(state, (dict, list)):
+        raise SystemExit("backup.json contains an unsupported icon state shape.")
+    return state
 
 
 def adapt_pages_shape(existing_pages: Any, new_pages: list[list[Any]]) -> list[Any]:
@@ -1183,45 +1049,6 @@ def adapt_container_shape(existing_container: Any, flat_items: list[Any]) -> lis
         rows.append(flat_items[index : index + row_length])
         index += row_length
     return rows
-
-
-def update_manifest_metadata(layout_file: LayoutFile) -> None:
-    manifest = layout_file.backup_dir / "Manifest.db"
-    try:
-        con = sqlite3.connect(manifest)
-        row = con.execute("SELECT file FROM Files WHERE fileID = ?", (layout_file.file_id,)).fetchone()
-        if not row or row[0] is None:
-            return
-        metadata = plistlib.loads(row[0])
-        if not isinstance(metadata, dict):
-            return
-
-        stat = layout_file.content_path.stat()
-        changed = False
-        for key in ("Size", "size"):
-            if key in metadata:
-                metadata[key] = stat.st_size
-                changed = True
-        for key in ("LastModified", "LastStatusChange", "Birth"):
-            if key in metadata:
-                metadata[key] = int(stat.st_mtime)
-                changed = True
-        if "Digest" in metadata:
-            metadata["Digest"] = hashlib.sha1(layout_file.content_path.read_bytes()).digest()
-            changed = True
-        if changed:
-            con.execute(
-                "UPDATE Files SET file = ? WHERE fileID = ?",
-                (plistlib.dumps(metadata, fmt=plistlib.FMT_BINARY, sort_keys=False), layout_file.file_id),
-            )
-            con.commit()
-    except Exception as exc:
-        print(f"Warning: could not update Manifest.db metadata: {exc}", file=sys.stderr)
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
 
 
 def read_json(path: Path) -> dict[str, Any]:
